@@ -270,6 +270,9 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
 
+        elif m in [SKAttention]:  # channels args
+            c2 = ch[f]
+            args = [c2, *args[0:]]
 
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
@@ -280,6 +283,12 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
 
+        # 添加bifpn_concat结构
+        elif m is BiFPN_Concat2:
+            c2 = sum(ch[x] for x in f)
+        # 添加bifpn_concat结构
+        elif m is BiFPN_Concat3:
+            c2 = sum(ch[x] for x in f)
 
 
         elif m is Expand:

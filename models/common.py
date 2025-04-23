@@ -678,3 +678,99 @@ class Classify(nn.Module):
 
 
 
+
+class SKAttention(nn.Module):
+
+    def __init__(self, channel=512, kernels=[1, 3, 5, 7], reduction=16, group=1, L=32):
+        super().__init__()
+        self.d = max(L, channel // reduction)
+        self.convs = nn.ModuleList([])
+        for k in kernels:
+            self.convs.append(
+                nn.Sequential(
+                    OrderedDict(
+                        [
+                            (
+                                "conv",
+                                nn.Conv2d(
+                                    channel,
+                                    channel,
+                                    kernel_size=k,
+                                    padding=k // 2,
+                                    groups=group,
+                                ),
+                            ),
+                            ("bn", nn.BatchNorm2d(channel)),
+                            ("relu", nn.ReLU()),
+                        ]
+                    )
+                )
+            )
+        self.fc = nn.Linear(channel, self.d)
+        self.fcs = nn.ModuleList([])
+        for i in range(len(kernels)):
+            self.fcs.append(nn.Linear(self.d, channel))
+        self.softmax = nn.Softmax(dim=0)
+
+    def forward(self, x):
+        bs, c, _, _ = x.size()
+        conv_outs = []
+        ### split
+        for conv in self.convs:
+            conv_outs.append(conv(x))
+        feats = torch.stack(conv_outs, 0)  # k,bs,channel,h,w
+
+        ### fuse
+        U = sum(conv_outs)  # bs,c,h,w
+
+        ### reduction channel
+        S = U.mean(-1).mean(-1)  # bs,c
+        Z = self.fc(S)  # bs,d
+
+        ### calculate attention weight
+        weights = []
+        for fc in self.fcs:
+            weight = fc(Z)
+            weights.append(weight.view(bs, c, 1, 1))  # bs,channel
+        attention_weughts = torch.stack(weights, 0)  # k,bs,channel,1,1
+        attention_weughts = self.softmax(attention_weughts)  # k,bs,channel,1,1
+
+        ### fuse
+        V = (attention_weughts * feats).sum(0)
+        return V
+
+
+# 结合BiFPN 设置可学习参数 学习不同分支的权重
+# 两个分支concat操作
+class BiFPN_Concat2(nn.Module):
+    def __init__(self, dimension=1):
+        super(BiFPN_Concat2, self).__init__()
+        self.d = dimension
+        self.w = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        self.epsilon = 0.0001
+
+    def forward(self, x):
+        w = self.w
+        weight = w / (torch.sum(w, dim=0) + self.epsilon)  # 将权重进行归一化
+        # Fast normalized fusion
+        x = [weight[0] * x[0], weight[1] * x[1]]
+        return torch.cat(x, self.d)
+
+
+# 三个分支concat操作
+class BiFPN_Concat3(nn.Module):
+    def __init__(self, dimension=1):
+        super(BiFPN_Concat3, self).__init__()
+        self.d = dimension
+        # 设置可学习参数 nn.Parameter的作用是：将一个不可训练的类型Tensor转换成可以训练的类型parameter
+        # 并且会向宿主模型注册该参数 成为其一部分 即model.parameters()会包含这个parameter
+        # 从而在参数优化的时候可以自动一起优化
+        self.w = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
+        self.epsilon = 0.0001
+
+    def forward(self, x):
+        w = self.w
+        weight = w / (torch.sum(w, dim=0) + self.epsilon)  # 将权重进行归一化
+        # Fast normalized fusion
+        x = [weight[0] * x[0], weight[1] * x[1], weight[2] * x[2]]
+        return torch.cat(x, self.d)

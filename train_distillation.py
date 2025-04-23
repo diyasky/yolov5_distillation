@@ -5,7 +5,7 @@ Train a YOLOv5 model on a custom dataset.
 Models and datasets download automatically from the latest YOLOv5 release.
 Models: https://github.com/ultralytics/yolov5/tree/master/models
 Datasets: https://github.com/ultralytics/yolov5/tree/master/data
-Tutorial: https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data
+Tutorial: https://github.com/ultralytics/yolov5/wiki/Train-Custom-Datadistill
 
 Usage:
     $ python path/to/train.py --data coco128.yaml --weights yolov5s.pt --img 640  # from pretrained (RECOMMENDED)
@@ -22,9 +22,6 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import os
-
-from models.common import BiFPN_Concat2, BiFPN_Concat3
-
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 import numpy as np
 import torch
@@ -56,7 +53,7 @@ from utils.general import (LOGGER, check_dataset, check_file, check_git_status, 
                            print_args, print_mutation, strip_optimizer)
 from utils.loggers import Loggers
 from utils.loggers.wandb.wandb_utils import check_wandb_resume
-from utils.loss import ComputeLoss
+from utils.loss import ComputeLoss, compute_distillation_output_loss
 from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
@@ -134,6 +131,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
 
+    if opt.distill:
+        print("load t-model from", opt.t_weights)
+        t_model = torch.load(opt.t_weights, map_location=torch.device('cpu'))
+        if t_model.get("model", None) is not None:
+            t_model = t_model["model"]
+        t_model.to(device)
+        t_model.float()
+        t_model.train()
+        
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -165,12 +171,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             g0.append(v.weight)
         elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
             g1.append(v.weight)
-
-        # BiFPN_Concat
-        elif isinstance(v, BiFPN_Concat2) and hasattr(v, 'w') and isinstance(v.w, nn.Parameter):
-            g1.append(v.w)
-        elif isinstance(v, BiFPN_Concat3) and hasattr(v, 'w') and isinstance(v.w, nn.Parameter):
-            g1.append(v.w)
 
     if opt.optimizer == 'Adam':
         optimizer = Adam(g0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
@@ -261,9 +261,23 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
         callbacks.run('on_pretrain_routine_end')
 
+  
     # DDP mode
     if cuda and RANK != -1:
         model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+        
+    if not opt.noautoanchor:
+        #det = model.module.model[-1] if is_parallel(model) else model.model[-1]
+        det = de_parallel(model).model[-1]
+        s_anchors = det.anchors  # shape = (3, 3, 2)
+        #t_det = t_model.module.model[-1] if is_parallel(t_model) else t_model.model[-1]
+        t_det = de_parallel(t_model).model[-1]  
+        t_anchors = t_det.anchors  # shape = (3, 3, 2)
+        reg_norm = torch.sqrt(t_anchors / s_anchors)
+        del det, t_det
+    else:
+        reg_norm = None
+    print(reg_norm)
 
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
@@ -287,9 +301,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     scaler = amp.GradScaler(enabled=cuda)
     stopper = EarlyStopping(patience=opt.patience)
     compute_loss = ComputeLoss(model)  # init loss class
+    dist_loss = opt.dist_loss
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
+                f'Distillation loss type: {dist_loss}\n'
                 f'Starting training for {epochs} epochs...')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
@@ -305,6 +321,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
         mloss = torch.zeros(3, device=device)  # mean losses
+        mdloss = torch.zeros(1, device=device)
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
@@ -338,7 +355,20 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
+                #loss, loss_items = compute_loss(pred, targets.to(device))
+                # loss scaled by batch_size
+                if opt.distill:
+                    with torch.no_grad():
+                        t_pred = t_model(imgs)
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                # distillation
+                if opt.distill:
+                    dloss = compute_distillation_output_loss(
+                        pred, t_pred, model, dist_loss, opt.temperature, reg_norm)
+                else:
+                    dloss = 0
+                loss += dloss
+                loss_items[-1] = loss
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -359,9 +389,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Log
             if RANK in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                mdloss = (mdloss * i + dloss) / (i + 1)
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
-                    f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                #pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
+                #    f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                pbar.set_description(('%10s' * 2 + '%10.4g' * 6) % (
+                    f'{epoch}/{epochs - 1}', mem, *mloss, mdloss, targets.shape[0], imgs.shape[-1]))
                 callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, opt.sync_bn)
                 if callbacks.stop_training:
                     return
@@ -464,6 +497,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
+    parser.add_argument('--t_weights', type=str,
+                        default='yolov5l.pt', help='initial tweights path')
+    parser.add_argument('--dist_loss', type=str,
+                        default='l2', help='using kl/l2 loss in distillation')
+    parser.add_argument('--temperature', type=int,
+                        default=20, help='temperature in distillation training')
+    parser.add_argument('--distill', action='store_true',
+                        help='distillation training')
     parser.add_argument('--cfg', type=str, default=ROOT / 'models/my_yolov5plus.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/mydata.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
